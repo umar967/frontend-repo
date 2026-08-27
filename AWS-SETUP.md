@@ -112,14 +112,85 @@ ENI_ID=$(aws ecs describe-tasks --cluster my-fargate-cluster --tasks $TASK_ARN -
 aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query 'NetworkInterfaces[0].Association.PublicIp' --output text
 ```
 
-## 6. Configure GitHub Actions
+## 6. Configure secure GitHub Actions authentication
 
-Both repositories deploy on a push to `main` and support manual runs from the Actions tab. Add these repository secrets in **Settings > Secrets and variables > Actions** for both repositories:
+`deploy.yml` builds the image, pushes it to ECR, updates the matching container in the ECS task definition, and waits for the service to stabilize. It is needed only for automated deployment; AWS can also be operated manually with the CLI.
 
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
+The workflows use GitHub OIDC. They do **not** store AWS access keys. AWS gives the workflow short-lived credentials only after verifying the repository and branch identity.
 
-Use a dedicated IAM user with only the ECR push, ECS task-definition registration, `iam:PassRole`, and ECS deployment permissions required by the workflows. OIDC-based GitHub Actions authentication is preferred for production because it avoids long-lived access keys.
+Create the GitHub OIDC provider once per AWS account, then create an IAM role trusted only by these two repositories and their `main` branches. Save the following as `trust-policy.json`, replacing `YOUR_GITHUB_OWNER` if needed:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": [
+          "repo:umar967/backend-repo:ref:refs/heads/main",
+          "repo:umar967/frontend-repo:ref:refs/heads/main"
+        ]
+      },
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      }
+    }
+  }]
+}
+```
+
+Run once, replacing `ACCOUNT_ID` in the provider ARN:
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+
+aws iam create-role \
+  --role-name github-actions-ecs-deploy \
+  --assume-role-policy-document file://trust-policy.json
+```
+
+Attach a deployment policy to this role. For a lab, the managed policies below are simple to start with; replace them with a least-privilege custom policy before production:
+
+```bash
+aws iam attach-role-policy --role-name github-actions-ecs-deploy \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+aws iam attach-role-policy --role-name github-actions-ecs-deploy \
+  --policy-arn arn:aws:iam::aws:policy/AmazonECS_FullAccess
+```
+
+Save this least-privilege policy as `github-pass-role-policy.json`, replacing `ACCOUNT_ID`, then attach it:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "iam:PassRole",
+    "Resource": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+    "Condition": { "StringEquals": { "iam:PassedToService": "ecs-tasks.amazonaws.com" } }
+  }]
+}
+```
+
+```bash
+aws iam put-role-policy --role-name github-actions-ecs-deploy \
+  --policy-name pass-ecs-task-execution-role \
+  --policy-document file://github-pass-role-policy.json
+```
+
+The task execution role from step 3 is separate from this GitHub deployment role.
+
+In **Settings > Secrets and variables > Actions** for both repositories, add one secret:
+
+- `AWS_ROLE_TO_ASSUME`: the ARN of `github-actions-ecs-deploy`
+
+Do not add AWS access keys to source code, workflow YAML, or GitHub secrets. If keys were previously created for this project, disable and delete them after OIDC is working.
 
 The workflows assume these AWS names:
 
